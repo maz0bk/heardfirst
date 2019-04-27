@@ -1,0 +1,264 @@
+//Александр, ничего не успел толком сделать. Добавил отправку файлов на сервак к варианту из примера.
+// Почему то не получатся подключить через мавен модуль common, получилось подключить через свойства проека, если
+// в мавене на жимаешь обновить то все настройки слетают.
+
+public class MainServer {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("server start");
+        new MainServer().run();
+    }
+    public void run() throws InterruptedException {
+        EventLoopGroup mainGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        try {
+            ServerBootstrap bootstrap = new ServerBootstrap();
+            bootstrap.group(mainGroup, workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .childHandler( new ChannelInitializer<SocketChannel>() {
+                        protected void initChannel(SocketChannel socketChannel) throws Exception {
+                            socketChannel.pipeline().addLast(
+                                    new ObjectDecoder(50 * 1024 * 1024, ClassResolvers.cacheDisabled(null)),
+                                    new ObjectEncoder(),
+                                    new MainHandler()
+                            );
+                        }
+                    })
+                    .childOption(ChannelOption.SO_KEEPALIVE, true);
+            ChannelFuture future = bootstrap.bind(8189).sync();
+            future.channel().closeFuture().sync();
+        } finally {
+            mainGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+
+    }
+}
+
+public class MainHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+    try {
+        if (msg == null) {
+            return;
+        }
+
+        if (msg instanceof FileRequest) {
+            FileRequest fr = (FileRequest) msg;
+            if (Files.exists(Paths.get("server/server_storage/" + fr.getFilename()))) {
+                FileMessage fm = new FileMessage(Paths.get("server/server_storage/" + fr.getFilename()));
+                ctx.writeAndFlush(fm);
+            }
+        }else if (msg instanceof FileMessage){
+            FileMessage fm = (FileMessage) msg;
+            Files.write(Paths.get("server/server_storage/" + fm.getFileName()), fm.getData(), StandardOpenOption.CREATE);
+        }
+    } finally {
+        ReferenceCountUtil.release(msg);
+    }
+}
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+
+public abstract class AbstractMessage implements Serializable {
+}
+
+public class FileMessage extends AbstractMessage {
+    private static final long serialVersionUID = 1;
+
+    private String fileName;
+    private double size;
+    private String sha1;
+    private String sha256;
+    private byte[] data;
+
+    public double getSize() {
+        return size;
+    }
+
+    public String getSha1() {
+        return sha1;
+    }
+
+    public String getSha256() {
+        return sha256;
+    }
+
+    public String getFileName() {
+        return fileName;
+    }
+
+    public byte[] getData() {
+        return data;
+    }
+
+    public FileMessage(Path path) throws IOException, NoSuchAlgorithmException {
+        fileName = path.getFileName().toString();
+        data = Files.readAllBytes(path);
+        sha1 = getChecksum("SHA1");
+//        sha256 = getChecksum("SHA256");
+        size = Files.size(path);
+    }
+
+    private String getChecksum( String hash) throws NoSuchAlgorithmException {
+        MessageDigest sha = MessageDigest.getInstance(hash);
+        sha.update(data);
+
+        byte[] hashBytes = sha.digest();
+        StringBuffer sb = new StringBuffer();
+        for (byte b : hashBytes){
+            sb.append(String.format("%02X",b));
+        }
+        return sb.toString();
+    }
+}
+
+public class FileRequest extends AbstractMessage {
+    private String filename;
+
+    public String getFilename() {
+        return filename;
+    }
+
+    public FileRequest(String filename) {
+        this.filename = filename;
+    }
+}
+
+public class Main extends Application {
+    @Override
+    public void start(Stage primaryStage) throws Exception {
+        Parent root = FXMLLoader.load(getClass().getResource("/main.fxml"));
+        primaryStage.setTitle("My cloud client");
+        primaryStage.setScene(new Scene(root,500,500));
+        primaryStage.show();
+
+    }
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
+
+public class Controller implements Initializable{
+    @FXML
+    ListView<String> filesClient;
+    @FXML
+    ListView<String> filesServer;
+
+    @Override
+    public void initialize(URL location, ResourceBundle resources) {
+        Network.start();
+        Thread t = new Thread(() -> {
+            try {
+                while (true) {
+                    AbstractMessage am = Network.readObject();
+                    if (am instanceof FileMessage) {
+                        FileMessage fm = (FileMessage) am;
+                        Files.write(Paths.get("client_storage/" + fm.getFileName()), fm.getData(), StandardOpenOption.CREATE);
+                        refreshLocalFilesList();
+                    }
+                }
+            } catch (ClassNotFoundException | IOException e) {
+                e.printStackTrace();
+            } finally {
+                Network.stop();
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+        refreshLocalFilesList();
+    }
+
+    public void pressOnDownloadBtn(ActionEvent actionEvent) {
+//        if (tfFileName.getLength() > 0) {
+//            Network.sendMsg(new FileRequest(tfFileName.getText()));
+//            tfFileName.clear();
+//        }
+    }
+
+    public void pressOnUploadBtn(ActionEvent actionEvent){
+       String fileName = filesClient.getSelectionModel().getSelectedItem();
+       if (! fileName.isEmpty() ){
+           try {
+               Network.sendMsg(new FileMessage(Paths.get("client/client_storage/"+fileName)));
+           } catch (IOException e) {
+               e.printStackTrace();
+           } catch (NoSuchAlgorithmException e) {
+               e.printStackTrace();
+           }
+       }
+    }
+
+    public void refreshLocalFilesList() {
+        if (Platform.isFxApplicationThread()) {
+            try {
+                filesClient.getItems().clear();
+                Files.list(Paths.get("client/client_storage")).map(p -> p.getFileName().toString()).forEach(o -> filesClient.getItems().add(o));
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        } else {
+            Platform.runLater(() -> {
+                try {
+                    filesClient.getItems().clear();
+                    Files.list(Paths.get("client/client_storage")).map(p -> p.getFileName().toString()).forEach(o -> filesClient.getItems().add(o));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+    }
+}
+
+public class Network {
+    private static Socket socket;
+    private static ObjectEncoderOutputStream out;
+    private static ObjectDecoderInputStream in;
+
+    public static void start() {
+        try {
+            socket = new Socket("localhost", 8189);
+            out = new ObjectEncoderOutputStream(socket.getOutputStream());
+            in = new ObjectDecoderInputStream(socket.getInputStream(), 50 * 1024 * 1024);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void stop() {
+        try {
+            out.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try {
+            in.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try {
+            socket.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static boolean sendMsg(AbstractMessage msg) {
+        try {
+            out.writeObject(msg);
+            return true;
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    public static AbstractMessage readObject() throws ClassNotFoundException, IOException {
+        Object obj = in.readObject();
+        return (AbstractMessage) obj;
+    }
+}
