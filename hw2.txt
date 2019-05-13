@@ -1,0 +1,608 @@
+Подскажите как определить на каком элементе активное выделение? Если использовать filesServer.getSelectionModel().getSelectedItem()
+и выделить файл на сервере, а потом на клиенте, то и в filesServer и в filesClient будет результат выделения.
+
+//CLIENT
+
+//Auth.fxml
+
+<VBox fx:id="mainVBox" alignment="CENTER" prefHeight="400.0" prefWidth="600.0" xmlns="http://javafx.com/javafx/8.0.121" xmlns:fx="http://javafx.com/fxml/1" fx:controller="com.maz.mycloud.client.AuthController">
+   <Label fx:id="errorLabel" text="Label" textFill="#e8310d" visible="false" />
+
+    <TextField fx:id="login" maxWidth="200" promptText="Login">
+        <VBox.margin>
+            <Insets bottom="10.0" />
+        </VBox.margin></TextField>
+    <PasswordField fx:id="password" maxWidth="200" promptText="Password" />
+    <Button onAction="#auth" prefWidth="200" text="Authorization">
+        <opaqueInsets>
+            <Insets />
+        </opaqueInsets>
+        <VBox.margin>
+            <Insets top="10.0" />
+        </VBox.margin></Button>
+</VBox>
+
+//main.fxml
+
+<VBox alignment="center" maxWidth="Infinity" xmlns="http://javafx.com/javafx/8.0.121"
+      xmlns:fx="http://javafx.com/fxml/1" fx:controller="com.maz.mycloud.client.Controller">
+    <HBox alignment="CENTER">
+        <children>
+            <Button onAction="#pressOnUploadBtn" text="Upload"/>
+            <Button onAction="#pressOnDownloadBtn" text="Download"/>
+            <Button onAction="#pressOnRefreshBtn" text="Refresh"/>
+            <Button onAction="#pressOnDeleteBtn" text="Delete"/>
+            <Button onAction="#pressOnRenameBtn" text="Rename"/>
+        </children>
+    </HBox>
+    <HBox alignment="CENTER" VBox.vgrow="ALWAYS" maxWidth="Infinity">
+        <children>
+            <ListView fx:id="filesClient" VBox.vgrow="ALWAYS"/>
+            <ListView fx:id="filesServer" VBox.vgrow="ALWAYS"/>
+        </children>
+    </HBox>
+</VBox>
+
+public class Main extends Application {
+    @Override
+    public void start(Stage primaryStage) throws Exception {
+        Parent root = FXMLLoader.load(getClass().getResource("/main.fxml"));
+        primaryStage.setTitle("My cloud client");
+        primaryStage.setScene(new Scene(root,500,500));
+        primaryStage.show();
+    }
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
+
+public class Network {
+    private static Socket socket;
+    private static ObjectEncoderOutputStream out;
+    private static ObjectDecoderInputStream in;
+
+    public static void start() {
+        try {
+            socket = new Socket("localhost", 8189);
+            out = new ObjectEncoderOutputStream(socket.getOutputStream());
+            in = new ObjectDecoderInputStream(socket.getInputStream(), 50 * 1024 * 1024);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void stop() {
+        try {
+            out.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try {
+            in.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try {
+            socket.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static boolean sendMsg(AbstractMessage msg) {
+        try {
+            out.writeObject(msg);
+            return true;
+        } catch (IOException e) {
+
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    public static AbstractMessage readObject() throws ClassNotFoundException, IOException {
+        Object obj = in.readObject();
+        return (AbstractMessage) obj;
+    }
+}
+
+public class Controller implements Initializable {
+    @FXML
+    ListView<String> filesClient;
+    @FXML
+    ListView<String> filesServer;
+
+    @Override
+    public void initialize(URL location, ResourceBundle resources) {
+        Network.start();
+        Thread t = new Thread(() -> {
+            try {
+                while (true) {
+                    AbstractMessage am = Network.readObject();
+                    if (am instanceof FileMessage) {
+                        FileMessage fm = (FileMessage) am;
+                        Files.write(Paths.get("client/client_storage/" + fm.getFileName()), fm.getData(), StandardOpenOption.CREATE);
+                        refreshLocalFilesList();
+                        continue;
+                    }
+                    if (am instanceof FileListRequest) {
+                        FileListRequest fileListRequest = (FileListRequest) am;
+                        refreshServerFileList(fileListRequest.getServerFiles());
+                        continue;
+                    }
+                    if (am instanceof AuthRequest) {
+                        AuthRequest authRequest = (AuthRequest) am;
+                        if (!authRequest.isAuthOk()) {
+                            showAuthWindow(authRequest.getAuthError());
+                            return;
+                        }
+                        refreshLocalFilesList();
+                        Network.sendMsg(new FileListRequest());
+                    }
+                }
+            } catch (ClassNotFoundException | IOException e) {
+                e.printStackTrace();
+            } finally {
+                Network.stop();
+                System.out.println("network stop");
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+        showAuthWindow("");
+    }
+
+    private void showAuthWindow(String errorMessage) {
+        GuiHelper.updateUI(() -> {
+            try {
+                Stage stage = new Stage();
+                FXMLLoader loader = new FXMLLoader(getClass().getResource("/Auth.fxml"));
+
+                Parent root = loader.load();
+                if (!errorMessage.isEmpty()) {
+                    AuthController authController = loader.getController();
+                    authController.errorLabel.setVisible(true);
+                    authController.errorLabel.setText(errorMessage);
+                }
+                stage.setTitle("Cloud authorization");
+                stage.setScene(new Scene(root, 400, 200));
+                stage.initModality(Modality.APPLICATION_MODAL);
+                stage.showAndWait();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    public void pressOnDownloadBtn(ActionEvent actionEvent) {
+        String fileName = filesServer.getSelectionModel().getSelectedItem();
+        if (!fileName.isEmpty()) {
+            Network.sendMsg(new FileRequest(fileName));
+        }
+    }
+
+    public void pressOnUploadBtn(ActionEvent actionEvent) {
+        String fileName = filesClient.getSelectionModel().getSelectedItem();
+        if (!fileName.isEmpty()) {
+            try {
+                Network.sendMsg(new FileMessage(Paths.get("client/client_storage/" + fileName)));
+            } catch (IOException | NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public void refreshLocalFilesList() {
+        GuiHelper.updateUI(() -> {
+            try {
+                filesClient.getItems().clear();
+                Files.list(Paths.get("client/client_storage")).map(p -> p.getFileName().toString()).forEach(o -> filesClient.getItems().add(o));
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void refreshServerFileList(List<String> serverFileList) {
+        GuiHelper.updateUI(() -> {
+            filesServer.getItems().clear();
+            filesServer.getItems().addAll(serverFileList);
+        });
+    }
+
+    public void pressOnRefreshBtn(ActionEvent actionEvent) {
+        Network.sendMsg(new FileListRequest());
+        refreshLocalFilesList();
+    }
+
+    public void pressOnDeleteBtn(ActionEvent actionEvent) {
+        String fileName = filesClient.getSelectionModel().getSelectedItem();
+        if (fileName != null && !fileName.isEmpty()) {
+            try {
+                Files.delete(Paths.get("client/client_storage/" + fileName));
+                refreshLocalFilesList();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        } else {
+            fileName = filesServer.getSelectionModel().getSelectedItem();
+            if (fileName != null && !fileName.isEmpty()) {
+                Network.sendMsg(new FileDeleteRequest(fileName));
+            }
+        }
+
+    }
+
+    public void pressOnRenameBtn(ActionEvent actionEvent) {
+        String fileName = filesClient.getSelectionModel().getSelectedItem();
+        if (fileName != null && !fileName.isEmpty()) {
+            String newFileName = askNewFileName(fileName);
+            if (!newFileName.isEmpty()) {
+                File fileOld = new File("client/client_storage/" + fileName);
+                File fileNew = new File("client/client_storage/" + newFileName);
+                fileOld.renameTo(fileNew);
+                refreshLocalFilesList();
+            }
+
+        } else {
+            fileName = filesServer.getSelectionModel().getSelectedItem();
+            if (fileName != null && !fileName.isEmpty()) {
+                String newFileName = askNewFileName(fileName);
+                if (!newFileName.isEmpty()) {
+                    Network.sendMsg(new FileRenameRequest(fileName, newFileName));
+                }
+            }
+        }
+
+    }
+
+    private String askNewFileName(String fileName) {
+        TextInputDialog dialog = new TextInputDialog();
+        dialog.setTitle("Rename file: " + fileName);
+        dialog.setHeaderText("New file name");
+        dialog.setContentText("Name:");
+        Optional<String> result = dialog.showAndWait();
+        if (result.isPresent()) {
+            return result.get();
+        }
+        return "";
+    }
+}
+
+public class AuthController {
+    @FXML
+    TextField login;
+
+    @FXML
+    PasswordField password;
+
+    @FXML
+    VBox mainVBox;
+
+    @FXML
+    Label errorLabel;
+
+    public void auth(ActionEvent actionEvent) {
+        Network.sendMsg(new AuthRequest(login.getText(), password.getText()));
+        mainVBox.getScene().getWindow().hide();
+    }
+}
+
+public class GuiHelper {
+    public static void updateUI(Runnable runnable){
+        if (Platform.isFxApplicationThread()){
+            runnable.run();
+        } else {
+            Platform.runLater(runnable);
+        }
+    }
+}
+
+//SERVER
+
+public class MainServer {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("server start");
+        new MainServer().run();
+    }
+    public void run() throws InterruptedException {
+        EventLoopGroup mainGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        try {
+            if(!SQLHandler.connect()){
+                throw new InterruptedException("Cannot connect to SQL Server!");
+            }
+            ServerBootstrap bootstrap = new ServerBootstrap();
+            bootstrap.group(mainGroup, workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .childHandler( new ChannelInitializer<SocketChannel>() {
+                        protected void initChannel(SocketChannel socketChannel) throws Exception {
+                            socketChannel.pipeline().addLast(
+                                    new ObjectDecoder(50 * 1024 * 1024, ClassResolvers.cacheDisabled(null)),
+                                    new ObjectEncoder(),
+                                    new AuthHandler()
+                            );
+                        }
+                    })
+                    .childOption(ChannelOption.SO_KEEPALIVE, true);
+            ChannelFuture future = bootstrap.bind(8189).sync();
+            future.channel().closeFuture().sync();
+        } finally {
+            mainGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+
+    }
+}
+
+public class SQLHandler {
+    private static Connection connection;
+    private static PreparedStatement psGetUserFolderByLoginPass;
+
+    public static boolean connect()  {
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            connection = DriverManager.getConnection("jdbc:mysql://localhost:3306/mycloud?serverTimezone=UTC", "root", "FlySky128#");
+            psGetUserFolderByLoginPass = connection.prepareStatement("SELECT folder FROM mycloud.users where login = ? and password = ?;");
+            return true;
+        } catch (ClassNotFoundException | SQLException e) {
+            e.printStackTrace();
+            return false;
+        }
+
+    }
+
+    public static String getUserFolder(AuthRequest authRequest){
+        try {
+            psGetUserFolderByLoginPass.setString(1,authRequest.getLogin());
+            psGetUserFolderByLoginPass.setString(2,authRequest.getPassword());
+            ResultSet rs = psGetUserFolderByLoginPass.executeQuery();
+            if (rs.next()){
+                return rs.getString(1);
+            }
+            rs.close();
+        } catch (SQLException e){
+            e.printStackTrace();
+        }
+        return "";
+    }
+}
+
+public class AuthHandler extends ChannelInboundHandlerAdapter {
+    private boolean authOk = false;
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        if (authOk) {
+            ctx.fireChannelRead(msg);
+            return;
+        }
+        if (msg instanceof AuthRequest) {
+            String userFolder = SQLHandler.getUserFolder((AuthRequest) msg);
+            if (userFolder.isEmpty()) {
+                ctx.writeAndFlush(new AuthRequest(authOk, "Wrong user name or password!"));
+                return;
+            }
+            authOk = true;
+            ctx.pipeline().addLast(new MainHandler(userFolder));
+            ctx.writeAndFlush(new AuthRequest(authOk));
+        }
+
+    }
+}
+
+public class MainHandler extends ChannelInboundHandlerAdapter {
+    private String userFolder;
+    private String root;
+
+    public MainHandler(String userFolder) {
+        this.userFolder = userFolder;
+        this.root = new StringBuilder("server").append(File.separator).append("server_storage").append(File.separator).append(this.userFolder).append(File.separator).toString();
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        try {
+            if (msg == null) {
+                return;
+            }
+
+            if (msg instanceof FileRequest) {
+                FileRequest fr = (FileRequest) msg;
+                if (Files.exists(Paths.get(root + fr.getFilename()))) {
+                    FileMessage fm = new FileMessage(Paths.get(root + fr.getFilename()));
+                    ctx.writeAndFlush(fm);
+                }
+                return;
+            }
+            if (msg instanceof FileMessage) {
+                FileMessage fm = (FileMessage) msg;
+                Files.write(Paths.get(root + fm.getFileName()), fm.getData(), StandardOpenOption.CREATE);
+                sendFileList(ctx);
+                return;
+            }
+            if (msg instanceof FileListRequest) {
+                sendFileList(ctx);
+                return;
+            }
+            if (msg instanceof FileRenameRequest) {
+                FileRenameRequest renameRequest = (FileRenameRequest) msg;
+                File fileOld = new File(root + renameRequest.getFilename());
+                File fileNew = new File(root + renameRequest.getNewFileName());
+                fileOld.renameTo(fileNew);
+                sendFileList(ctx);
+                return;
+            }
+            if (msg instanceof FileDeleteRequest){
+                FileDeleteRequest deleteRequest = (FileDeleteRequest) msg;
+                Files.delete(Paths.get(root+ deleteRequest.getFilename()));
+                sendFileList(ctx);
+            }
+        } finally {
+            ReferenceCountUtil.release(msg);
+        }
+    }
+    private void sendFileList(ChannelHandlerContext ctx) throws IOException {
+        FileListRequest fileListRequest = new FileListRequest();
+        Files.list(Paths.get(root)).map(p -> p.getFileName().toString()).forEach(o -> fileListRequest.addFile(o));
+        ctx.writeAndFlush(fileListRequest);
+    }
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+
+//COMMON
+public abstract class AbstractMessage implements Serializable {
+}
+
+public class AuthRequest extends AbstractMessage {
+    private String login;
+    private String password;
+    private boolean authOk;
+    private String authError;
+
+    public AuthRequest(boolean authOk, String authError) {
+        this.authOk = authOk;
+        this.authError = authError;
+    }
+
+    public String getAuthError() {
+        return authError;
+    }
+
+    public boolean isAuthOk() {
+
+        return authOk;
+    }
+
+    public AuthRequest(String login, String password) {
+        this.login = login;
+        this.password = password;
+    }
+
+    public String getLogin() {
+        return login;
+    }
+
+    public AuthRequest(boolean authOk) {
+        this.authOk = authOk;
+    }
+
+    public String getPassword() {
+
+        return password;
+    }
+}
+
+public class FileDeleteRequest extends AbstractMessage {
+    private String filename;
+
+    public String getFilename() {
+        return filename;
+    }
+
+    public FileDeleteRequest(String filename) {
+        this.filename = filename;
+    }
+}
+
+public class FileListRequest extends AbstractMessage {
+    private List<String> serverFiles;
+
+    public List<String> getServerFiles() {
+        return serverFiles;
+    }
+    public void addFile(String fileName){
+        serverFiles.add(fileName);
+    }
+
+    public FileListRequest() {
+        this.serverFiles = new ArrayList<String>();
+    }
+}
+
+public class FileMessage extends AbstractMessage {
+    private static final long serialVersionUID = 1;
+
+    private String fileName;
+    private double size;
+    private String sha1;
+    private String sha256;
+    private byte[] data;
+
+    public double getSize() {
+        return size;
+    }
+
+    public String getSha1() {
+        return sha1;
+    }
+
+    public String getSha256() {
+        return sha256;
+    }
+
+    public String getFileName() {
+        return fileName;
+    }
+
+    public byte[] getData() {
+        return data;
+    }
+
+    public FileMessage(Path path) throws IOException, NoSuchAlgorithmException {
+        fileName = path.getFileName().toString();
+        data = Files.readAllBytes(path);
+        sha1 = getChecksum("SHA1");
+//        sha256 = getChecksum("SHA256");
+        size = Files.size(path);
+    }
+
+    private String getChecksum( String hash) throws NoSuchAlgorithmException {
+        MessageDigest sha = MessageDigest.getInstance(hash);
+        sha.update(data);
+
+        byte[] hashBytes = sha.digest();
+        StringBuffer sb = new StringBuffer();
+        for (byte b : hashBytes){
+            sb.append(String.format("%02X",b));
+        }
+        return sb.toString();
+    }
+}
+
+public class FileRenameRequest extends AbstractMessage {
+    private String filename;
+    private String newFileName;
+
+    public String getFilename() {
+        return filename;
+    }
+
+    public String getNewFileName() {
+        return newFileName;
+    }
+
+    public FileRenameRequest(String filename, String newFileName) {
+        this.filename = filename;
+        this.newFileName = newFileName;
+    }
+}
+
+public class FileRequest extends AbstractMessage {
+    private String filename;
+
+    public String getFilename() {
+        return filename;
+    }
+
+    public FileRequest(String filename) {
+        this.filename = filename;
+    }
+}
+
